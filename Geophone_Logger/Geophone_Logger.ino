@@ -32,7 +32,7 @@
 #define LED_TYPE          LED_STRIP_WS2812
 #define LED_TYPE_IS_RGBW  0  // if the LED is an RGBW type, change the 0 to 1
 #define LED_BRIGHT        20
-#define LED_PIN           18    // LED pins
+#define LED_PIN           2    // LED pins
 
 static const crgb_t RED = 0xff0000;
 static const crgb_t GREEN = 0x00ff00;
@@ -41,9 +41,11 @@ static const crgb_t BLUE = 0x0000ff;
 
 
 // I2C settings
+// Pins for I2C line 0 with RTC and Lipo monitor connected
 #define PIN_SDA_0 21
 #define PIN_SCL_0 22
 
+// Pins for I2C line 0 with ADS1015s connected
 #define PIN_SDA_1 16
 #define PIN_SCL_1 17
 #define I2C_CLOCK_SPEED 1000000  //1MHz
@@ -61,6 +63,12 @@ static const crgb_t BLUE = 0x0000ff;
 #define GEOPHONE_DATA_SIZE  NUMBER_CHUCKS * SIZE_CHUCK
 #define THRESHOLD           100   // at which the recording of the data will occur
 #define RECORDING_MOMENT    GEOPHONE_DATA_SIZE/3  // 1/3 of the data before the threshold and 2/3 after
+#define TOO_LOW_BATTERY_VOLTAGE   3.5
+#define VOLTAGE_LOGGING_TIME_SEC 3600
+
+#define uS_TO_S_FACTOR 1000000ULL  /* Conversion factor for micro seconds to seconds */
+#define TIME_TO_SLEEP  1680        /* Time ESP32 will go to sleep (in seconds) 1680 = 28 minutes*/
+RTC_DATA_ATTR int bootCount = 0;
 
 // SD card settings and configuration
 #define SD_FAT_TYPE 3
@@ -92,18 +100,23 @@ SdFile myFile;
 #error Invalid SD_FAT_TYPE
 #endif  // SD_FAT_TYPE
 
+
+
+volatile static bool lowPower = false;
 volatile static bool flag_Geophone_event = false;
 volatile static int16_t int_bufferToSave[GEOPHONE_DATA_SIZE]; // 
 
-double voltage = 0;
+float voltage = 0;
+bool low_voltage = false;
 
 char geophoneData[16384];  //Array to hold the geophone data. Factor of 512 for easier recording to SD in 512 chunks
 
 // tasks to sample geophones and record the data
 TaskHandle_t Sampling_Geophones;
-TaskHandle_t Task2;
+TaskHandle_t Saving_Events;
 
-
+// to modify threshold, gain
+int incoming = 0; // for incoming serial data
 
 
 TwoWire Wire_0 = TwoWire(0);
@@ -124,37 +137,16 @@ RV8803 RTC;
 LiteLED myLED(LED_TYPE, LED_TYPE_IS_RGBW);  // create the LiteLED object
 
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
+
+
+  ++bootCount;
+  Serial.println("Boot number: " + String(bootCount));
 
   rtc_wdt_protect_off();    // Turns off the automatic wdt service
 
   Wire_0.begin(PIN_SDA_0, PIN_SCL_0, I2C_CLOCK_SPEED); // start I2C for RTC and Battery monitoring
   Wire_1.begin(PIN_SDA_1, PIN_SCL_1, I2C_CLOCK_SPEED); // start I2C for ADS1015s
-
-  if (ADS_48.begin(0x48, Wire_1) == true) {
-    Serial.println("Device 0x48 found. I2C connections are good.");
-  } else {
-    Serial.println("Device 0x48 not found. Check wiring.");
-    while (1)
-      ;  // stall out forever
-  }
-
-  if (ADS_49.begin(0x49, Wire_1) == true) {
-    Serial.println("Device 0x49 found. I2C connections are good.");
-  } else {
-    Serial.println("Device 0x4A not found. Check wiring.");
-    while (1)
-      ;  // stall out forever
-  }
-
-  if (ADS_4A.begin(0x4A, Wire_1) == true) {
-    Serial.println("Device 0x4A found. I2C connections are good.");
-  } else {
-    Serial.println("Device 0x4A not found. Check wiring.");
-    while (1)
-      ;  // stall out forever
-  }
-
 
   // Set up the MAX17043 LiPo fuel gauge:
   if (lipo.begin(Wire_0) == false) // Connect to the MAX17043 using the default wire port
@@ -163,8 +155,45 @@ void setup() {
     while (1)
       ;
   }
-  
+
+  esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+  Serial.println("Setup ESP32 to sleep for " + String(TIME_TO_SLEEP) +
+  " Seconds if battery too low");
+
   lipo.quickStart();
+  delay(50);
+  voltage = lipo.getVoltage();
+  if(voltage <= TOO_LOW_BATTERY_VOLTAGE)
+  {
+    low_voltage = true;
+  }
+
+  if (ADS_48.begin(0x48, Wire_1) == true) {
+    Serial.println("ADS1015 with address 0x48 found. I2C connections are good.");
+  } else {
+    Serial.println("ADS1015 with address 0x48 not found. Check wiring.");
+    while (1)
+      ;  // stall out forever
+  }
+
+  if (ADS_49.begin(0x49, Wire_1) == true) {
+    Serial.println("ADS1015 with address 0x49 found. I2C connections are good.");
+  } else {
+    Serial.println("ADS1015 with address 0x49 not found. Check wiring.");
+    while (1)
+      ;  // stall out forever
+  }
+
+  if (ADS_4A.begin(0x4A, Wire_1) == true) {
+    Serial.println("ADS1015 with address 0x4A found. I2C connections are good.");
+  } else {
+    Serial.println("ADS1015 with address 0x4A not found. Check wiring.");
+    while (1)
+      ;  // stall out forever
+  }
+
+
+
 
   if (RTC.begin(Wire_0) == false) {
     Serial.println("Device RTC not found. Please check wiring. Freezing.");
@@ -173,10 +202,13 @@ void setup() {
   }
   Serial.println("RTC online!");
 
-  if (RTC.setToCompilerTime() == false)
+  // set the RTC time to compiler time, only to be used one and not leaving in the running code
+  /* if (RTC.setToCompilerTime() == false)
     Serial.println("Something went wrong setting the time");
   else
     Serial.println("New time set!");
+ */
+
   RTC.set24Hour();
 
   ADS_48.setSampleRate(SAMPLING_SPEED);
@@ -192,11 +224,13 @@ void setup() {
   ADS_4A.setGain(GAIN);
 
 
-  myLED.begin(LED_GPIO, 1);      // initialze the myLED object. Here we have 1 LED attached to the LED_GPIO pin
+  myLED.begin(LED_PIN, 1);      // initialze the myLED object. Here we have 1 LED attached to the LED_GPIO pin
   myLED.brightness(LED_BRIGHT);  // set the LED photon intensity level
   myLED.setPixel(0, GREEN, 1);
 
-  pinMode(LED_PIN, OUTPUT);
+
+
+
 
 
 
@@ -215,11 +249,11 @@ void setup() {
   //create a task that will be executed in the Task2code() function, with priority 1 and executed on core 1
   xTaskCreatePinnedToCore(
     Task2code, /* Task function. */
-    "Task2",   /* name of task. */
+    "Saving_Events",   /* name of task. */
     10000,     /* Stack size of task */
     NULL,      /* parameter of the task */
     1,         /* priority of the task */
-    &Task2,    /* Task handle to keep track of created task */
+    &Saving_Events,    /* Task handle to keep track of created task */
     1);        /* pin task to core 1 */
   delay(500);
 }
@@ -242,7 +276,6 @@ void Task1code(void* pvParameters) {
   CircularBuffer<int16_t, NUMBER_CHUCKS * 512> buffer;
   
   for (;;) {
-
     if (PRINT_TIME) {
       counter++;
       if (counter == GEOPHONE_DATA_SIZE) {
@@ -261,7 +294,6 @@ void Task1code(void* pvParameters) {
     buffer.push(sensor_1);
     buffer.push(sensor_2);
 
-
     if (( abs(buffer[RECORDING_MOMENT]) > THRESHOLD || 
           abs(buffer[RECORDING_MOMENT+1])> THRESHOLD || 
           abs(buffer[RECORDING_MOMENT+2]) > THRESHOLD) && 
@@ -272,7 +304,7 @@ void Task1code(void* pvParameters) {
           int_bufferToSave[j] = buffer[j];
       }
       flag_Geophone_event = true;
-    
+
     }
   }
 }
@@ -283,7 +315,7 @@ void Task2code(void* pvParameters) {
     sd.initErrorHalt(&Serial);
   }
   delay(200);
-  Serial.print("Task2 running on core ");
+  Serial.print("Saving_Events running on core ");
   Serial.println(xPortGetCoreID());
 
   String currentTime = "\0";
@@ -296,12 +328,31 @@ void Task2code(void* pvParameters) {
   RTC.disableAllInterrupts();
   RTC.clearAllInterruptFlags();//Clear all flags in case any interrupts have occurred.
   RTC.setCountdownTimerFrequency(COUNTDOWN_TIMER_FREQUENCY_1_HZ);
-  RTC.setCountdownTimerClockTicks(3600);
+  RTC.setCountdownTimerClockTicks(VOLTAGE_LOGGING_TIME_SEC);
   RTC.enableHardwareInterrupt(TIMER_INTERRUPT);
   RTC.setCountdownTimerEnable(1); //This will start the timer on the last clock tick of the I2C transaction
 
 
   for (;;) {
+    // if too low voltage at the startup, will go straignt to sleep
+    if(low_voltage)
+    {
+      if (RTC.updateTime() == true)  //Updates the time variables from RTC
+      {
+        currentDate = RTC.stringDate();  //Get the current date
+        currentTime = RTC.stringTime();  //Get the time
+      } 
+
+      myFile.print(currentDate);
+      myFile.print(",");
+      myFile.print(currentTime);
+      myFile.print(",");      
+      myFile.println("Voltage is too low to log");
+      myFile.close();
+      delay(250);
+      esp_deep_sleep_start();
+    }
+
 
     geophoneData[0] = '\0';
     if (flag_Geophone_event) 
@@ -330,7 +381,7 @@ void Task2code(void* pvParameters) {
       }
 
       // test if can open the SD card and create/add data to it
-      if (!myFile.open("geophoneDATAtrial_090823.csv", O_RDWR | O_CREAT | O_AT_END)) {
+      if (!myFile.open("geophoneDATAtrial_after.csv", O_RDWR | O_CREAT | O_AT_END)) {
         sd.errorHalt("opening test.txt for write failed");
       }
 
@@ -365,12 +416,13 @@ void Task2code(void* pvParameters) {
         Serial.println("can't update time");
       }
 
-      if (!myFile.open("geophoneDATAtrial_090823.csv", O_RDWR | O_CREAT | O_AT_END)) 
+      if (!myFile.open("geophoneDATAtrial_after.csv", O_RDWR | O_CREAT | O_AT_END)) 
       {
         sd.errorHalt("opening test.txt for write failed");
       }
       // record LiPo battery voltage to SD card
       voltage = lipo.getVoltage();
+
       sprintf(tempData, "%f", voltage);
       myFile.print(currentDate);
       myFile.print(",");
@@ -380,6 +432,21 @@ void Task2code(void* pvParameters) {
       myFile.print(",");
       myFile.println(tempData);
       myFile.close();
+
+      if(voltage <= TOO_LOW_BATTERY_VOLTAGE)
+      {
+        Serial.println("Battery Voltage too low, going to sleep");
+        Serial.flush(); 
+
+        if (!myFile.open("geophoneDATAtrial_after.csv", O_RDWR | O_CREAT | O_AT_END)) 
+        {
+          sd.errorHalt("opening test.txt for write failed");
+        }
+        myFile.println("battery voltage too low, going to sleep");
+        myFile.close();
+        delay(250);
+        esp_deep_sleep_start();
+      }
 
       Serial.print("time: ");
       Serial.print(currentTime);  // Print the battery voltage
